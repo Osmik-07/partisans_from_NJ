@@ -72,9 +72,8 @@ def create_dispatcher() -> Dispatcher:
 async def main_polling():
     bot = create_bot()
     dp = create_dispatcher()
-    dp.startup.register(lambda: on_startup(bot))
+    dp.startup.register(on_startup)
     await dp.start_polling(bot)
-
 
 async def main_webhook():
     bot = create_bot()
