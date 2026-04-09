@@ -3,7 +3,7 @@ from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from bot.services.subscription import get_or_create_user
+from bot.services.subscription import get_or_create_user, get_user
 from bot.keyboards.main import main_menu_kb, plans_kb, back_main_kb
 
 router = Router()
@@ -57,10 +57,25 @@ async def cb_help_connect(call: CallbackQuery):
 @router.callback_query(F.data == "sub:status")
 async def cb_status(call: CallbackQuery, session: AsyncSession):
     from datetime import datetime, timezone
-    from bot.services.subscription import get_user
+    from sqlalchemy import select
+    from db.models import Subscription
 
     user = await get_user(session, call.from_user.id)
-    sub = user.active_subscription if user else None
+
+    now = datetime.now(timezone.utc)
+    sub = None
+    if user:
+        result = await session.execute(
+            select(Subscription)
+            .where(
+                Subscription.user_id == user.id,
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+            )
+            .order_by(Subscription.expires_at.desc())
+            .limit(1)
+        )
+        sub = result.scalar_one_or_none()
 
     if sub:
         expires = sub.expires_at.strftime("%d.%m.%Y %H:%M")
@@ -77,5 +92,6 @@ async def cb_status(call: CallbackQuery, session: AsyncSession):
             "Купи подписку, чтобы начать отслеживание."
         )
 
-    await call.message.edit_text(text, reply_markup=plans_kb(not user.trial_used if user else True), parse_mode="HTML")
+    trial_ok = not user.trial_used if user else True
+    await call.message.edit_text(text, reply_markup=plans_kb(trial_ok), parse_mode="HTML")
     await call.answer()

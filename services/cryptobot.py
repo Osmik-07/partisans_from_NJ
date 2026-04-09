@@ -31,7 +31,7 @@ async def create_invoice(
                 "description": PLAN_NAMES.get(plan, "Подписка NotSpyBot"),
                 "payload": payload,
                 "paid_btn_name": "callback",
-                "paid_btn_url": f"https://t.me/{settings.bot_username}",
+                "paid_btn_url": "https://t.me/notspybot",
                 "expires_in": 3600,  # 1 час
             },
         )
