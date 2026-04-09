@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 from sqlalchemy import select, update
 from db.models import User, Subscription, Payment, SubscriptionPlan, PaymentMethod, PaymentStatus
 
@@ -35,6 +36,7 @@ async def get_or_create_user(session: AsyncSession, tg_user) -> User:
 async def get_user(session: AsyncSession, user_id: int) -> User | None:
     result = await session.execute(
         select(User)
+        .options(selectinload(User.subscriptions))
         .where(User.id == user_id)
         .with_for_update()
     )

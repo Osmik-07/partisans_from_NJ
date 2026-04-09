@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from bot.config import settings
 from bot.keyboards.main import admin_kb, back_main_kb
-from bot.services.subscription import get_stats, get_user
+from bot.services.subscription import get_stats
 from db.models import User
 
 router = Router()
@@ -15,7 +15,6 @@ def is_admin(user_id: int) -> bool:
     return user_id in settings.admin_ids
 
 
-# ── /admin ────────────────────────────────────────────────────────────
 @router.message(Command("admin"))
 async def cmd_admin(message: Message):
     if not is_admin(message.from_user.id):
@@ -23,7 +22,6 @@ async def cmd_admin(message: Message):
     await message.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_kb(), parse_mode="HTML")
 
 
-# ── Статистика ────────────────────────────────────────────────────────
 @router.callback_query(F.data == "admin:stats")
 async def cb_admin_stats(call: CallbackQuery, session: AsyncSession):
     if not is_admin(call.from_user.id):
@@ -55,7 +53,6 @@ async def cb_admin_menu(call: CallbackQuery):
     await call.answer()
 
 
-# ── Управление пользователями ─────────────────────────────────────────
 @router.callback_query(F.data == "admin:users")
 async def cb_admin_users(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -120,20 +117,28 @@ async def cmd_unban(message: Message, session: AsyncSession):
 async def cmd_userinfo(message: Message, session: AsyncSession):
     if not is_admin(message.from_user.id):
         return
+
     parts = message.text.split()
     if len(parts) < 2:
         await message.answer("Использование: /userinfo <user_id>")
         return
+
     try:
         uid = int(parts[1])
     except ValueError:
         await message.answer("Неверный ID")
         return
-    from sqlalchemy import select
-    from db.models import Subscription
-    from datetime import datetime, timezone
 
-    user = await session.get(User, uid)
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    result = await session.execute(
+        select(User)
+        .options(selectinload(User.subscriptions))
+        .where(User.id == uid)
+    )
+    user = result.scalar_one_or_none()
+
     if not user:
         await message.answer("Пользователь не найден")
         return
@@ -156,7 +161,6 @@ async def cmd_userinfo(message: Message, session: AsyncSession):
     await message.answer(text, parse_mode="HTML")
 
 
-# ── Рассылка ──────────────────────────────────────────────────────────
 @router.callback_query(F.data == "admin:broadcast")
 async def cb_broadcast_start(call: CallbackQuery):
     if not is_admin(call.from_user.id):
