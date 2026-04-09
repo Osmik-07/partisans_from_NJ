@@ -1,26 +1,31 @@
-"""
-Business Bot handler — ядро бота.
-Перехватывает:
-  1. Удалённые сообщения (business_messages_deleted)
-  2. Отредактированные сообщения (edited_business_message)
-  3. Исчезающие фото/видео (обычные сообщения с has_protected_content или
-     photo/video с флагом self_destruct — Telegram отдаёт их через бизнес-события)
-"""
+from datetime import datetime, timezone
 from aiogram import Router, F, Bot
-from aiogram.types import (
-    BusinessMessagesDeleted,
-    Message,
-    BusinessConnection,
-)
+from aiogram.types import BusinessMessagesDeleted, Message, BusinessConnection
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 
 from db.base import AsyncSessionLocal
-from db.models import User, SavedMessage, MessageType
-from bot.services.subscription import get_user
+from db.models import User, Subscription, SavedMessage, MessageType
 from bot.utils.formatters import format_user_link, format_deleted_notify, format_edited_notify
 
 router = Router()
+
+
+async def get_owner_if_active(business_connection_id: str) -> User | None:
+    """Возвращает владельца business-аккаунта только если у него есть активная подписка."""
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        # Один запрос: находим пользователя у которого есть активная подписка
+        result = await session.execute(
+            select(User)
+            .join(Subscription, Subscription.user_id == User.id)
+            .where(
+                User.business_connection_id == business_connection_id,
+                Subscription.is_active == True,
+                Subscription.expires_at > now,
+            )
+        )
+        return result.scalar_one_or_none()
 
 
 # ── Бизнес-соединение подключено / отключено ─────────────────────────
@@ -32,7 +37,6 @@ async def on_business_connection(bc: BusinessConnection):
             return
         if bc.is_enabled:
             user.business_connection_id = bc.id
-            from datetime import datetime, timezone
             user.business_connected_at = datetime.now(timezone.utc)
             await session.commit()
             await bc.bot.send_message(
@@ -49,7 +53,7 @@ async def on_business_connection(bc: BusinessConnection):
             await bc.bot.send_message(
                 bc.user.id,
                 "🔴 <b>Бизнес-бот отключён.</b>\n\n"
-                "Отслеживание остановлено. Подключи снова через Настройки → Telegram для бизнеса.",
+                "Отслеживание остановлено.",
                 parse_mode="HTML",
             )
 
@@ -57,23 +61,17 @@ async def on_business_connection(bc: BusinessConnection):
 # ── Удалённые сообщения ───────────────────────────────────────────────
 @router.deleted_business_messages()
 async def on_deleted_messages(event: BusinessMessagesDeleted, bot: Bot):
-    async with AsyncSessionLocal() as session:
-        owner_id = event.chat.id  # владелец business аккаунта = чат, где произошло
-        # Находим владельца по business_connection_id
-        result = await session.execute(
-            select(User).where(User.business_connection_id == event.business_connection_id)
-        )
-        owner: User | None = result.scalar_one_or_none()
-        if not owner or not owner.has_access:
-            return
+    owner = await get_owner_if_active(event.business_connection_id)
+    if not owner:
+        return
 
+    async with AsyncSessionLocal() as session:
         for msg in event.messages:
             sender = msg.from_user
             text = msg.text or msg.caption or ""
             media_file_id = None
             media_type = None
 
-            # Определяем тип медиа
             if msg.photo:
                 media_file_id = msg.photo[-1].file_id
                 media_type = "photo"
@@ -108,15 +106,15 @@ async def on_deleted_messages(event: BusinessMessagesDeleted, bot: Bot):
             )
             session.add(saved)
 
-            # Уведомляем владельца
             notify_text = format_deleted_notify(msg, sender)
             try:
                 if media_file_id and media_type:
                     await _send_media(bot, owner.id, media_file_id, media_type, notify_text)
                 else:
                     await bot.send_message(owner.id, notify_text, parse_mode="HTML")
-            except Exception:
-                pass
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Failed to notify {owner.id}: {e}")
 
         await session.commit()
 
@@ -124,15 +122,15 @@ async def on_deleted_messages(event: BusinessMessagesDeleted, bot: Bot):
 # ── Отредактированные сообщения ───────────────────────────────────────
 @router.edited_business_message()
 async def on_edited_message(message: Message, bot: Bot):
-    async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(User).where(User.business_connection_id == message.business_connection_id)
-        )
-        owner: User | None = result.scalar_one_or_none()
-        if not owner or not owner.has_access:
-            return
+    owner = await get_owner_if_active(message.business_connection_id)
+    if not owner:
+        return
 
-        # Получаем оригинальный текст из БД (если сохранён)
+    new_text = message.text or message.caption or ""
+    sender = message.from_user
+
+    async with AsyncSessionLocal() as session:
+        # Получаем предыдущую версию текста
         prev_result = await session.execute(
             select(SavedMessage)
             .where(
@@ -145,9 +143,6 @@ async def on_edited_message(message: Message, bot: Bot):
         )
         prev = prev_result.scalar_one_or_none()
         old_text = prev.new_text if prev else None
-        new_text = message.text or message.caption or ""
-
-        sender = message.from_user
 
         saved = SavedMessage(
             owner_id=owner.id,
@@ -164,48 +159,40 @@ async def on_edited_message(message: Message, bot: Bot):
         session.add(saved)
         await session.commit()
 
-        notify_text = format_edited_notify(message, sender, old_text, new_text)
-        try:
-            await bot.send_message(owner.id, notify_text, parse_mode="HTML")
-        except Exception:
-            pass
+    notify_text = format_edited_notify(message, sender, old_text, new_text)
+    try:
+        await bot.send_message(owner.id, notify_text, parse_mode="HTML")
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to notify {owner.id}: {e}")
 
 
 # ── Исчезающие фото/видео ─────────────────────────────────────────────
 @router.business_message(F.photo | F.video)
 async def on_business_message_media(message: Message, bot: Bot):
-    """
-    Перехватываем все медиа-сообщения в бизнес-чате.
-    Telegram передаёт self-destructing media через business message handler.
-    """
     if not message.business_connection_id:
         return
 
+    is_vanishing = getattr(message, "has_media_spoiler", False)
+    if not is_vanishing:
+        return
+
+    owner = await get_owner_if_active(message.business_connection_id)
+    if not owner:
+        return
+
+    sender = message.from_user
+    media_file_id = None
+    media_type = None
+
+    if message.photo:
+        media_file_id = message.photo[-1].file_id
+        media_type = "photo"
+    elif message.video:
+        media_file_id = message.video.file_id
+        media_type = "video"
+
     async with AsyncSessionLocal() as session:
-        result = await session.execute(
-            select(User).where(User.business_connection_id == message.business_connection_id)
-        )
-        owner: User | None = result.scalar_one_or_none()
-        if not owner or not owner.has_access:
-            return
-
-        # Определяем, исчезающее ли (has_media_spoiler или protect_content)
-        is_vanishing = getattr(message, "has_media_spoiler", False)
-        msg_type = MessageType.VANISHING_PHOTO if is_vanishing else None
-        if not is_vanishing:
-            return  # обычные медиа не сохраняем
-
-        sender = message.from_user
-        media_file_id = None
-        media_type = None
-
-        if message.photo:
-            media_file_id = message.photo[-1].file_id
-            media_type = "photo"
-        elif message.video:
-            media_file_id = message.video.file_id
-            media_type = "video"
-
         saved = SavedMessage(
             owner_id=owner.id,
             message_type=MessageType.VANISHING_PHOTO,
@@ -221,17 +208,15 @@ async def on_business_message_media(message: Message, bot: Bot):
         session.add(saved)
         await session.commit()
 
-        sender_link = format_user_link(sender)
-        try:
-            await _send_media(
-                bot,
-                owner.id,
-                media_file_id,
-                media_type,
-                f"📸 <b>Исчезающее фото</b> от {sender_link}",
-            )
-        except Exception:
-            pass
+    sender_link = format_user_link(sender)
+    try:
+        await _send_media(
+            bot, owner.id, media_file_id, media_type,
+            f"📸 <b>Исчезающее фото</b> от {sender_link}",
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(f"Failed to notify {owner.id}: {e}")
 
 
 async def _send_media(bot: Bot, chat_id: int, file_id: str, media_type: str, caption: str):
